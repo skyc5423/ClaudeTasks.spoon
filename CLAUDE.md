@@ -8,16 +8,18 @@ ClaudeTasks.spoon is a Hammerspoon Spoon that provides a floating WebView-based 
 
 ## Architecture
 
-Single-file Spoon architecture in `init.lua` (~1200 lines) with these key sections:
+Single-file Spoon architecture in `init.lua` (~1800 lines) with these key sections:
 
-1. **Configuration** (lines 19-34): UI dimensions, debounce timing, external tool paths
-2. **Discovery** (lines 40-66): Auto-discovers `claude` CLI, terminal app, shell
-3. **State Management** (lines 72-197): Persists session ID to `state.json`
-4. **Task Loading** (lines 203-253): Reads JSON task files from session directories
-5. **HTML Rendering** (lines 259-768): Dark-themed HTML/CSS/JS for WebView
-6. **WebView** (lines 774-844): Floating HUD window management
-7. **File Watching** (lines 850-907): Debounced `hs.pathwatcher` for auto-refresh
-8. **Public API** (lines 914-1205): Spoon methods (`start`, `stop`, `show`, `toggle`, etc.)
+1. **Configuration** (lines 19-40): UI dimensions, debounce timing, external tool paths, SSH settings
+2. **Discovery** (lines 46-72): Auto-discovers `claude` CLI, terminal app, shell
+3. **Server Management**: Manages local and SSH remote servers via `servers.json`
+4. **State Management**: Persists session ID and active server to `state.json`
+5. **Task Loading**: Reads JSON task files from local or remote (via SSH) directories
+6. **SSH Remote Support**: SSH task fetching with polling (pathwatcher doesn't work remotely)
+7. **HTML Rendering**: Dark-themed HTML/CSS/JS for WebView with server selector
+8. **WebView**: Floating HUD window management
+9. **File Watching**: Debounced `hs.pathwatcher` for local, polling for SSH
+10. **Public API**: Spoon methods including server management (`addServer`, `removeServer`, etc.)
 
 ### JS-Lua Bridge
 
