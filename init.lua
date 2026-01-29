@@ -31,6 +31,13 @@ obj.config = {
     claudePath = nil,
     terminalApp = nil,
     shell = nil,
+
+    -- SSH/Remote settings
+    sshPath = "/usr/bin/ssh",
+    sshPollingInterval = 5,      -- seconds
+    sshConnectTimeout = 10,      -- seconds
+    sshCommandTimeout = 30,      -- seconds
+    enableSSHCompression = true, -- use -C flag
 }
 
 -- ============================================================================
@@ -71,7 +78,9 @@ end
 
 obj.state = {
     currentTaskListId = nil,
-    configPath = nil  -- Set in init()
+    activeServerId = "local",
+    configPath = nil,   -- Set in init()
+    serversPath = nil   -- Set in init()
 }
 
 -- ============================================================================
@@ -83,6 +92,17 @@ local pathWatcher = nil
 local refreshTimer = nil
 local isVisible = false
 local usercontent = nil  -- JS-Lua 브릿지
+
+-- SSH/Remote state
+local pollingTimer = nil
+local sshTask = nil
+local sshTimeoutTimer = nil
+local lastSSHError = nil
+local cachedRemoteTasks = {}
+local cachedRemoteSessions = {}
+
+-- Forward declarations
+local refreshWebView
 
 -- ============================================================================
 -- 유틸리티 함수
@@ -143,6 +163,70 @@ local function readFile(path)
 end
 
 -- ============================================================================
+-- 서버 설정 관리
+-- ============================================================================
+
+local function getDefaultServers()
+    return {
+        servers = {{
+            id = "local",
+            name = "Local",
+            type = "local",
+            tasksDir = "~/.claude/tasks"
+        }},
+        activeServerId = "local"
+    }
+end
+
+local function loadServers()
+    if not obj.state.serversPath then
+        return getDefaultServers()
+    end
+    local f = io.open(obj.state.serversPath, "r")
+    if not f then
+        return getDefaultServers()
+    end
+    local content = f:read("*all")
+    f:close()
+    local data = parseJSON(content)
+    if not data or not data.servers then
+        return getDefaultServers()
+    end
+    return data
+end
+
+local function saveServers(data)
+    if not obj.state.serversPath then return end
+    local f = io.open(obj.state.serversPath, "w")
+    if f then
+        f:write(hs.json.encode(data, true))
+        f:close()
+        log("Servers saved")
+    end
+end
+
+local function getServerById(serverId)
+    local data = loadServers()
+    for _, server in ipairs(data.servers) do
+        if server.id == serverId then
+            return server
+        end
+    end
+    return nil
+end
+
+local function getActiveServer()
+    local data = loadServers()
+    local serverId = obj.state.activeServerId or data.activeServerId or "local"
+    return getServerById(serverId)
+end
+
+local function listServers()
+    local data = loadServers()
+    return data.servers
+end
+
+-- ============================================================================
 -- 상태 관리 함수
 -- ============================================================================
 
@@ -154,25 +238,37 @@ local function loadState()
         local data = parseJSON(content)
         if data then
             obj.state.currentTaskListId = data.currentTaskListId
+            obj.state.activeServerId = data.activeServerId or "local"
             obj.config.taskListId = data.currentTaskListId
-            log("State loaded: " .. (data.currentTaskListId or "nil"))
+            log("State loaded: taskListId=" .. (data.currentTaskListId or "nil")
+                .. ", server=" .. (data.activeServerId or "local"))
         end
     end
 end
 
 local function saveState()
     local data = hs.json.encode({
-        currentTaskListId = obj.state.currentTaskListId
+        currentTaskListId = obj.state.currentTaskListId,
+        activeServerId = obj.state.activeServerId
     })
     local f = io.open(obj.state.configPath, "w")
     if f then
         f:write(data)
         f:close()
-        log("State saved: " .. (obj.state.currentTaskListId or "nil"))
+        log("State saved: taskListId=" .. (obj.state.currentTaskListId or "nil")
+            .. ", server=" .. (obj.state.activeServerId or "local"))
     end
 end
 
 local function listSessionDirs()
+    local server = getActiveServer()
+
+    -- SSH 서버인 경우 캐시된 세션 목록 반환
+    if server and server.type == "ssh" then
+        return cachedRemoteSessions
+    end
+
+    -- 로컬 서버
     local tasksDir = getTasksDir()
     if not fileExists(tasksDir) then
         return {}
@@ -201,6 +297,15 @@ end
 -- ============================================================================
 
 local function loadAllTasks()
+    local server = getActiveServer()
+
+    -- SSH 서버인 경우 캐시된 태스크 반환
+    if server and server.type == "ssh" then
+        log("Returning " .. #cachedRemoteTasks .. " cached remote tasks")
+        return cachedRemoteTasks
+    end
+
+    -- 로컬 서버
     local tasks = {}
     local tasksDir = getTasksDir()
 
@@ -310,6 +415,24 @@ local function generateHTML(tasks)
         )
     end
     local currentSessionValue = obj.state.currentTaskListId or ''
+
+    -- 서버 옵션 생성
+    local servers = listServers()
+    local activeServer = getActiveServer()
+    local serverOptions = ''
+    for _, server in ipairs(servers) do
+        local selected = (activeServer and server.id == activeServer.id) and ' selected' or ''
+        local indicator = server.type == "ssh" and "🌐 " or "💻 "
+        serverOptions = serverOptions .. string.format(
+            '<option value="%s"%s>%s%s</option>',
+            escapeHtml(server.id),
+            selected,
+            indicator,
+            escapeHtml(server.name)
+        )
+    end
+    local isRemoteServer = activeServer and activeServer.type == "ssh"
+    local remoteDisabled = isRemoteServer and ' disabled title="Not available for remote servers"' or ''
 
     local html = [[
 <!DOCTYPE html>
@@ -554,6 +677,56 @@ local function generateHTML(tasks)
             border-radius: 4px;
             color: #888;
         }
+        /* Server selector */
+        .server-row {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+        .server-select {
+            flex: 1;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #e5e5e5;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .server-select:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+        .server-select option {
+            background: #1e1e1e;
+            color: #e5e5e5;
+        }
+        .icon-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #888;
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .icon-btn:hover {
+            background: rgba(255, 255, 255, 0.15);
+            color: #fff;
+        }
+        .connection-error {
+            background: rgba(239, 68, 68, 0.2);
+            border: 1px solid rgba(239, 68, 68, 0.5);
+            color: #fca5a5;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            margin-bottom: 12px;
+            display: none;
+        }
+        .connection-error.visible {
+            display: block;
+        }
     </style>
     <script>
         let isCreating = false;
@@ -621,6 +794,50 @@ local function generateHTML(tasks)
             });
         }
 
+        // Server management
+        function onServerChange(serverId) {
+            window.webkit.messageHandlers.taskBridge.postMessage({
+                action: 'setServer',
+                serverId: serverId
+            });
+        }
+
+        function showAddServerDialog() {
+            window.webkit.messageHandlers.taskBridge.postMessage({
+                action: 'showAddServerDialog'
+            });
+        }
+
+        function removeCurrentServer() {
+            var select = document.getElementById('serverSelect');
+            var serverId = select.value;
+            if (serverId === 'local') {
+                alert('Cannot remove local server');
+                return;
+            }
+            if (confirm('Remove server "' + select.options[select.selectedIndex].text + '"?')) {
+                window.webkit.messageHandlers.taskBridge.postMessage({
+                    action: 'removeServer',
+                    serverId: serverId
+                });
+            }
+        }
+
+        function showConnectionError(message) {
+            var errorDiv = document.getElementById('connectionError');
+            if (errorDiv) {
+                errorDiv.textContent = '⚠ ' + message;
+                errorDiv.classList.add('visible');
+            }
+        }
+
+        function hideConnectionError() {
+            var errorDiv = document.getElementById('connectionError');
+            if (errorDiv) {
+                errorDiv.classList.remove('visible');
+            }
+        }
+
         // 키보드 단축키
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
@@ -646,11 +863,19 @@ local function generateHTML(tasks)
         <div class="header-row">
             <span class="title">Claude Tasks</span>
             <div class="header-actions">
-                <button id="quickUpdateBtn" class="launch-btn quick-update-btn" onclick="showQuickUpdateDialog()" title="Quick Task ⌘E"]] .. (currentSessionValue == '' and ' disabled' or '') .. [[>⚡</button>
-                <button id="launchBtn" class="launch-btn" onclick="launchClaude()" title="Launch Claude session"]] .. (currentSessionValue == '' and ' disabled' or '') .. [[>▶</button>
+                <button id="quickUpdateBtn" class="launch-btn quick-update-btn" onclick="showQuickUpdateDialog()" title="Quick Task ⌘E"]] .. ((currentSessionValue == '' or isRemoteServer) and ' disabled' or '') .. [[>⚡</button>
+                <button id="launchBtn" class="launch-btn" onclick="launchClaude()" title="Launch Claude session"]] .. ((currentSessionValue == '' or isRemoteServer) and ' disabled' or '') .. [[>▶</button>
                 <span class="count">]] .. #tasks .. [[ tasks</span>
             </div>
         </div>
+        <div class="server-row">
+            <select class="server-select" id="serverSelect" onchange="onServerChange(this.value)">
+                ]] .. serverOptions .. [[
+            </select>
+            <button class="icon-btn" onclick="showAddServerDialog()" title="Add SSH Server">+</button>
+            <button class="icon-btn" onclick="removeCurrentServer()" title="Remove Current Server">−</button>
+        </div>
+        <div id="connectionError" class="connection-error"></div>
         <input type="text" class="session-input" id="sessionInput" list="sessionList"
                value="]] .. escapeHtml(currentSessionValue) .. [["
                placeholder="Enter or select session..."
@@ -768,6 +993,234 @@ local function generateHTML(tasks)
 end
 
 -- ============================================================================
+-- SSH 원격 태스크 로딩
+-- ============================================================================
+
+local function buildSSHArgs(server, remoteCommand)
+    local args = {}
+
+    -- Connection options
+    table.insert(args, "-o")
+    table.insert(args, "ConnectTimeout=" .. (server.connectTimeout or obj.config.sshConnectTimeout))
+    table.insert(args, "-o")
+    table.insert(args, "BatchMode=yes")
+    table.insert(args, "-o")
+    table.insert(args, "StrictHostKeyChecking=accept-new")
+
+    -- Compression
+    if obj.config.enableSSHCompression then
+        table.insert(args, "-C")
+    end
+
+    -- Port
+    if server.port and server.port ~= 22 then
+        table.insert(args, "-p")
+        table.insert(args, tostring(server.port))
+    end
+
+    -- Identity file
+    if server.identityFile then
+        table.insert(args, "-i")
+        table.insert(args, server.identityFile:gsub("^~", os.getenv("HOME")))
+    end
+
+    -- Host
+    local hostSpec = server.host
+    if server.user then
+        hostSpec = server.user .. "@" .. server.host
+    end
+    table.insert(args, hostSpec)
+
+    -- Remote command
+    table.insert(args, remoteCommand)
+
+    return args
+end
+
+local function buildRemoteFetchCommand(server, sessionId)
+    local tasksDir = (server.tasksDir or "~/.claude/tasks"):gsub("^~", "$HOME")
+    local sessionFilter = sessionId or ""
+
+    -- Shell script using awk instead of sed to avoid delimiter issues
+    local script = string.format([[
+TASKS_DIR=$(eval echo %s)
+SESSION_FILTER="%s"
+if [ ! -d "$TASKS_DIR" ]; then
+  echo '{"sessions":[],"tasks":[]}'
+  exit 0
+fi
+cd "$TASKS_DIR" || exit 1
+sessions=$(find . -maxdepth 2 -name "*.json" -type f 2>/dev/null | cut -d/ -f2 | sort -u)
+echo -n '{"sessions":['
+first=1
+for s in $sessions; do
+  [ $first -eq 0 ] && echo -n ','
+  echo -n "\"$s\""
+  first=0
+done
+echo -n '],"tasks":['
+first=1
+for s in $sessions; do
+  [ -n "$SESSION_FILTER" ] && [ "$s" != "$SESSION_FILTER" ] && continue
+  for f in "$s"/*.json; do
+    [ -f "$f" ] || continue
+    [ $first -eq 0 ] && echo -n ','
+    awk -v sid="$s" -v fpath="$f" 'BEGIN{ORS=""} {print} END{print ""}' "$f" | awk -v sid="$s" -v fpath="$f" '{sub(/}$/,",\"_sessionId\":\""sid"\",\"_filepath\":\""fpath"\"}"); print}'
+    first=0
+  done
+done
+echo ']}'
+]], tasksDir, sessionFilter)
+
+    return script
+end
+
+local function loadRemoteTasks(callback)
+    local server = getActiveServer()
+    if not server or server.type ~= "ssh" then
+        callback(nil, "Not an SSH server")
+        return
+    end
+
+    -- Cancel existing SSH task
+    if sshTask and sshTask:isRunning() then
+        sshTask:terminate()
+    end
+
+    local remoteCmd = buildRemoteFetchCommand(server, obj.config.taskListId)
+    local args = buildSSHArgs(server, remoteCmd)
+
+    log("SSH fetch from " .. server.name .. ": " .. server.host)
+
+    sshTask = hs.task.new(obj.config.sshPath, function(exitCode, stdout, stderr)
+        sshTask = nil
+
+        -- Cancel timeout timer
+        if sshTimeoutTimer then
+            sshTimeoutTimer:stop()
+            sshTimeoutTimer = nil
+        end
+
+        -- Always log SSH results for debugging
+        print("[ClaudeTasks] SSH exitCode: " .. tostring(exitCode))
+        if stderr and stderr ~= "" then
+            print("[ClaudeTasks] SSH stderr: " .. stderr:sub(1, 500))
+        end
+        if stdout then
+            print("[ClaudeTasks] SSH stdout length: " .. #stdout)
+            if #stdout < 1000 then
+                print("[ClaudeTasks] SSH stdout: " .. stdout)
+            else
+                print("[ClaudeTasks] SSH stdout (truncated): " .. stdout:sub(1, 500) .. "...")
+            end
+        end
+
+        -- exitCode 15 = SIGTERM (normal termination by polling timer)
+        if exitCode ~= 0 and exitCode ~= 15 then
+            lastSSHError = stderr or "SSH connection failed (exit " .. exitCode .. ")"
+            print("[ClaudeTasks] SSH error: " .. lastSSHError)
+            callback(nil, lastSSHError)
+            return
+        end
+
+        -- SIGTERM - ignore, just return without updating
+        if exitCode == 15 then
+            print("[ClaudeTasks] SSH terminated by polling timer (normal)")
+            return
+        end
+
+        lastSSHError = nil
+        local data = parseJSON(stdout)
+        if not data then
+            lastSSHError = "Failed to parse remote response"
+            print("[ClaudeTasks] Parse error, raw stdout: " .. (stdout or "empty"):sub(1, 500))
+            callback(nil, lastSSHError)
+            return
+        end
+
+        -- Sort tasks
+        if data.tasks then
+            table.sort(data.tasks, function(a, b)
+                local aNum = tonumber(a.id)
+                local bNum = tonumber(b.id)
+                if aNum and bNum then return aNum < bNum end
+                return tostring(a.id) < tostring(b.id)
+            end)
+        end
+
+        -- Cache results
+        cachedRemoteTasks = data.tasks or {}
+        cachedRemoteSessions = data.sessions or {}
+
+        print("[ClaudeTasks] SSH loaded " .. #cachedRemoteTasks .. " tasks, " .. #cachedRemoteSessions .. " sessions")
+        callback(data, nil)
+    end, args)
+
+    -- Timeout handler
+    if sshTimeoutTimer then
+        sshTimeoutTimer:stop()
+    end
+    sshTimeoutTimer = hs.timer.doAfter(obj.config.sshCommandTimeout, function()
+        if sshTask and sshTask:isRunning() then
+            sshTask:terminate()
+            sshTask = nil
+            lastSSHError = "SSH command timed out"
+            callback(nil, lastSSHError)
+        end
+        sshTimeoutTimer = nil
+    end)
+
+    sshTask:start()
+end
+
+local function stopPolling()
+    if pollingTimer then
+        pollingTimer:stop()
+        pollingTimer = nil
+        log("Polling stopped")
+    end
+    if sshTimeoutTimer then
+        sshTimeoutTimer:stop()
+        sshTimeoutTimer = nil
+    end
+    if sshTask and sshTask:isRunning() then
+        sshTask:terminate()
+        sshTask = nil
+    end
+end
+
+local function startPolling()
+    local server = getActiveServer()
+    if not server or server.type ~= "ssh" then
+        return
+    end
+
+    stopPolling()
+
+    local function pollFunc()
+        loadRemoteTasks(function(data, err)
+            if data then
+                if isVisible and webview then
+                    refreshWebView()
+                end
+            elseif err and isVisible and webview then
+                local safeErr = (err or "Unknown error"):gsub("['\"\\]", ""):gsub("\n", " "):gsub("\r", ""):sub(1, 200)
+                webview:evaluateJavaScript(
+                    "if(typeof showConnectionError==='function')showConnectionError('" .. safeErr .. "')"
+                )
+            end
+        end)
+    end
+
+    -- Initial fetch
+    pollFunc()
+
+    -- Recurring polls
+    pollingTimer = hs.timer.doEvery(obj.config.sshPollingInterval, pollFunc)
+    log("Polling started (interval: " .. obj.config.sshPollingInterval .. "s)")
+end
+
+-- ============================================================================
 -- WebView 관리
 -- ============================================================================
 
@@ -791,6 +1244,32 @@ local function createUserContent()
             if button == "OK" and text and text ~= "" then
                 obj:quickTaskUpdate(text)
             end
+        elseif msg.body.action == "setServer" then
+            obj:setActiveServer(msg.body.serverId)
+        elseif msg.body.action == "showAddServerDialog" then
+            -- Multi-step dialog for adding SSH server
+            local button, name = hs.dialog.textPrompt("Add SSH Server", "Enter server name (display name):", "", "Next", "Cancel")
+            if button ~= "Next" or not name or name == "" then return end
+
+            local button2, host = hs.dialog.textPrompt("Add SSH Server", "Enter hostname (e.g., dev.example.com):", "", "Next", "Cancel")
+            if button2 ~= "Next" or not host or host == "" then return end
+
+            local button3, port = hs.dialog.textPrompt("Add SSH Server", "Enter SSH port:", "22", "Next", "Cancel")
+            if button3 ~= "Next" then return end
+
+            local button4, user = hs.dialog.textPrompt("Add SSH Server", "Enter SSH username:", os.getenv("USER") or "", "Add", "Cancel")
+            if button4 ~= "Add" then return end
+
+            obj:addServer({
+                id = name:lower():gsub("%s+", "-"):gsub("[^%w%-]", ""),
+                name = name,
+                host = host,
+                port = tonumber(port) or 22,
+                user = (user ~= "") and user or nil,
+                type = "ssh"
+            })
+        elseif msg.body.action == "removeServer" then
+            obj:removeServer(msg.body.serverId)
         end
     end)
 
@@ -834,12 +1313,28 @@ local function createWebView()
     return webview
 end
 
-local function refreshWebView()
+refreshWebView = function()
     if not webview then return end
 
     local tasks = loadAllTasks()
     local html = generateHTML(tasks)
     webview:html(html)
+
+    -- SSH 에러 표시/숨김
+    local server = getActiveServer()
+    if server and server.type == "ssh" then
+        if lastSSHError then
+            local safeErr = (lastSSHError or "Unknown error"):gsub("['\"\\]", ""):gsub("\n", " "):gsub("\r", ""):sub(1, 200)
+            webview:evaluateJavaScript(
+                "if(typeof showConnectionError==='function')showConnectionError('" .. safeErr .. "')"
+            )
+        else
+            webview:evaluateJavaScript(
+                "if(typeof hideConnectionError==='function')hideConnectionError()"
+            )
+        end
+    end
+
     log("WebView refreshed with " .. #tasks .. " tasks")
 end
 
@@ -913,6 +1408,7 @@ end
 --- Initialize the Spoon
 function obj:init()
     obj.state.configPath = obj.spoonPath .. "/state.json"
+    obj.state.serversPath = obj.spoonPath .. "/servers.json"
     log("ClaudeTasks Spoon initialized")
     return self
 end
@@ -925,7 +1421,15 @@ function obj:show()
     refreshWebView()
     webview:show()
     isVisible = true
-    startPathWatcher()
+
+    -- 서버 타입에 따라 감시 방식 선택
+    local server = getActiveServer()
+    if server and server.type == "ssh" then
+        startPolling()
+    else
+        startPathWatcher()
+    end
+
     log("Task viewer shown")
     return self
 end
@@ -964,12 +1468,151 @@ function obj:setTaskListId(id)
     saveState()
     log("Session changed to: " .. (sessionId or "none"))
 
-    -- 파일 감시 재시작 (새 세션에 맞게)
-    stopPathWatcher()
-    startPathWatcher()
+    -- 서버 타입에 따라 감시 재시작
+    local server = getActiveServer()
+    if server and server.type == "ssh" then
+        stopPolling()
+        startPolling()
+    else
+        stopPathWatcher()
+        startPathWatcher()
+    end
 
     -- UI 새로고침
     obj:refresh()
+    return self
+end
+
+--- 활성 서버 설정
+function obj:setActiveServer(serverId)
+    local server = getServerById(serverId)
+    if not server then
+        hs.alert.show("Server not found: " .. serverId, 2)
+        return self
+    end
+
+    -- 상태 업데이트
+    local data = loadServers()
+    data.activeServerId = serverId
+    saveServers(data)
+    obj.state.activeServerId = serverId
+
+    -- 감시 방식 전환
+    stopPathWatcher()
+    stopPolling()
+
+    -- 세션 필터 초기화 (서버 변경 시)
+    obj.state.currentTaskListId = nil
+    obj.config.taskListId = nil
+    cachedRemoteTasks = {}
+    cachedRemoteSessions = {}
+    lastSSHError = nil
+
+    if server.type == "ssh" then
+        startPolling()
+    else
+        startPathWatcher()
+    end
+
+    saveState()
+    obj:refresh()
+    log("Switched to server: " .. serverId .. " (" .. server.name .. ")")
+    return self
+end
+
+--- SSH 서버 추가
+function obj:addServer(serverConfig)
+    local data = loadServers()
+
+    -- 필수 필드 검증
+    if not serverConfig.id or not serverConfig.host then
+        hs.alert.show("Server requires id and host", 2)
+        return self
+    end
+
+    -- 중복 ID 체크
+    for _, s in ipairs(data.servers) do
+        if s.id == serverConfig.id then
+            hs.alert.show("Server ID already exists: " .. serverConfig.id, 2)
+            return self
+        end
+    end
+
+    -- 기본값 설정
+    serverConfig.type = serverConfig.type or "ssh"
+    serverConfig.name = serverConfig.name or serverConfig.host
+    serverConfig.port = serverConfig.port or 22
+    serverConfig.tasksDir = serverConfig.tasksDir or "~/.claude/tasks"
+    serverConfig.connectTimeout = serverConfig.connectTimeout or obj.config.sshConnectTimeout
+
+    table.insert(data.servers, serverConfig)
+    saveServers(data)
+
+    hs.alert.show("Server added: " .. serverConfig.name, 2)
+    log("Server added: " .. serverConfig.id .. " (" .. serverConfig.host .. ")")
+    obj:refresh()
+    return self
+end
+
+--- SSH 서버 제거
+function obj:removeServer(serverId)
+    if serverId == "local" then
+        hs.alert.show("Cannot remove local server", 2)
+        return self
+    end
+
+    local data = loadServers()
+    for i, s in ipairs(data.servers) do
+        if s.id == serverId then
+            local serverName = s.name
+            table.remove(data.servers, i)
+
+            -- 활성 서버가 제거되면 로컬로 전환
+            if data.activeServerId == serverId then
+                data.activeServerId = "local"
+                obj:setActiveServer("local")
+            end
+
+            saveServers(data)
+            hs.alert.show("Server removed: " .. serverName, 2)
+            log("Server removed: " .. serverId)
+            obj:refresh()
+            return self
+        end
+    end
+
+    hs.alert.show("Server not found: " .. serverId, 2)
+    return self
+end
+
+--- SSH 연결 테스트
+function obj:testConnection(serverId)
+    local server = getServerById(serverId)
+    if not server then
+        hs.alert.show("Server not found: " .. serverId, 2)
+        return self
+    end
+
+    if server.type ~= "ssh" then
+        hs.alert.show("Not an SSH server", 2)
+        return self
+    end
+
+    hs.alert.show("Testing connection to " .. server.name .. "...", 1)
+
+    local args = buildSSHArgs(server, "echo 'Connection successful'")
+
+    hs.task.new(obj.config.sshPath, function(exitCode, stdout, stderr)
+        if exitCode == 0 then
+            hs.alert.show("✓ Connected to " .. server.name, 2)
+            log("Connection test passed: " .. server.host)
+        else
+            local errMsg = (stderr or "Unknown error"):gsub("\n", " ")
+            hs.alert.show("✗ Connection failed: " .. errMsg:sub(1, 50), 3)
+            log("Connection test failed: " .. errMsg)
+        end
+    end, args):start()
+
     return self
 end
 
@@ -1024,6 +1667,13 @@ end
 
 --- Quick TaskUpdate (haiku 모델로 빠른 태스크 업데이트)
 function obj:quickTaskUpdate(prompt)
+    -- 원격 서버에서는 사용 불가
+    local server = getActiveServer()
+    if server and server.type == "ssh" then
+        hs.alert.show("Quick Update not available for remote servers", 2)
+        return
+    end
+
     local taskListId = obj.state.currentTaskListId
     if not taskListId or taskListId == "" then
         hs.alert.show("Select a session first", 2)
@@ -1087,6 +1737,13 @@ end
 
 --- Claude Code 세션 실행
 function obj:launchClaudeWithTaskList()
+    -- 원격 서버에서는 사용 불가
+    local server = getActiveServer()
+    if server and server.type == "ssh" then
+        hs.alert.show("Launch not available for remote servers", 2)
+        return
+    end
+
     local taskListId = obj.state.currentTaskListId
     if not taskListId or taskListId == "" then
         hs.alert.show("Select a session first", 2)
@@ -1120,14 +1777,23 @@ end
 --- 모듈 시작 (파일 감시 시작)
 function obj:start()
     loadState()  -- 저장된 상태 로드
-    startPathWatcher()
-    log("Claude Tasks module started")
+
+    -- 서버 타입에 따라 감시 방식 선택
+    local server = getActiveServer()
+    if server and server.type == "ssh" then
+        startPolling()
+    else
+        startPathWatcher()
+    end
+
+    log("Claude Tasks module started (server: " .. (server and server.name or "local") .. ")")
     return self
 end
 
 --- 모듈 중지
 function obj:stop()
     stopPathWatcher()
+    stopPolling()
     if webview then
         webview:delete()
         webview = nil
@@ -1167,6 +1833,8 @@ function obj:status()
         end
     end
 
+    local server = getActiveServer()
+
     return {
         visible = isVisible,
         taskCount = #tasks,
@@ -1176,6 +1844,11 @@ function obj:status()
         taskListId = obj.config.taskListId,
         currentTaskListId = obj.state.currentTaskListId,
         watcherActive = pathWatcher ~= nil,
+        pollingActive = pollingTimer ~= nil,
+        activeServer = server and server.name or "Local",
+        activeServerId = obj.state.activeServerId,
+        serverType = server and server.type or "local",
+        lastSSHError = lastSSHError,
     }
 end
 

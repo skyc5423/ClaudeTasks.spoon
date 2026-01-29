@@ -14,6 +14,7 @@ Hammerspoon Spoon for viewing Claude Code tasks in a floating window.
 - Quick TaskUpdate via dialog (⌘E)
 - Launch Claude session in terminal (▶ button)
 - Task status summary hotkey
+- **SSH remote server support** - View tasks from remote servers via SSH
 
 ## Installation
 
@@ -84,6 +85,10 @@ spoon.ClaudeTasks:start()
 - `obj:status()` - Get current status info
 - `obj:configure(options)` - Update configuration
 - `obj:bindHotkeys(mapping)` - Bind hotkeys
+- `obj:setActiveServer(serverId)` - Switch to a different server
+- `obj:addServer(config)` - Add a new SSH server
+- `obj:removeServer(serverId)` - Remove an SSH server
+- `obj:testConnection(serverId)` - Test SSH connection to a server
 
 ### Configuration Options
 
@@ -98,6 +103,54 @@ spoon.ClaudeTasks:start()
 | `claudePath` | nil | Path to claude CLI (auto-discovered if nil) |
 | `terminalApp` | nil | Path to terminal app (auto-discovered if nil) |
 | `shell` | nil | Shell to use (defaults to `$SHELL` or `/bin/zsh`) |
+| `sshPath` | `/usr/bin/ssh` | Path to SSH binary |
+| `sshPollingInterval` | 5 | Remote task polling interval (seconds) |
+| `sshConnectTimeout` | 10 | SSH connection timeout (seconds) |
+| `sshCommandTimeout` | 30 | SSH command timeout (seconds) |
+| `enableSSHCompression` | true | Enable SSH compression (-C flag) |
+
+## SSH Remote Servers
+
+You can view tasks from remote servers via SSH. The remote server must have Claude Code tasks in `~/.claude/tasks/`.
+
+### Adding a Remote Server
+
+1. Click the **+** button next to the server dropdown
+2. Enter server name, hostname, and SSH username
+3. The server will be added to the dropdown
+
+Or use the Lua API:
+
+```lua
+spoon.ClaudeTasks:addServer({
+    id = "my-server",
+    name = "My Dev Server",
+    host = "dev.example.com",
+    user = "ubuntu",
+    port = 22,                    -- optional, default: 22
+    identityFile = "~/.ssh/id_rsa", -- optional
+    tasksDir = "~/.claude/tasks"  -- optional, default: ~/.claude/tasks
+})
+```
+
+### Testing Connection
+
+```lua
+spoon.ClaudeTasks:testConnection("my-server")
+```
+
+### Removing a Server
+
+```lua
+spoon.ClaudeTasks:removeServer("my-server")
+```
+
+### Notes
+
+- SSH key authentication is required (password prompts are disabled via `BatchMode=yes`)
+- Remote servers use polling instead of file watching (default: every 5 seconds)
+- Quick TaskUpdate and Launch Claude are disabled for remote servers
+- The remote server needs `python3` for best results, falls back to shell commands
 
 ## Requirements
 
